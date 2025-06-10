@@ -1,34 +1,20 @@
-import requests
+import aiohttp
 from bs4 import BeautifulSoup
-from app.db import SessionLocal
+from app.db import get_session
 from app.models import Car
-from sqlalchemy.exc import IntegrityError
 from app.config import START_URL
+from sqlalchemy.exc import IntegrityError
+import asyncio
 import re
-import time
 from random import uniform
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 
-def create_session():
-    session = requests.Session()
-
-    retries = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[500, 502, 503, 504]
-    )
-
-    adapter = HTTPAdapter(
-        max_retries=retries,
-        pool_connections=10,
-        pool_maxsize=10
-    )
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-
-    return session
+async def fetch(session, url):
+    await asyncio.sleep(uniform(0.5, 2))
+    headers = {'User-Agent': 'Mozilla/5.0 ...'}
+    async with session.get(url, headers=headers) as response:
+        response.raise_for_status()
+        return await response.text()
 
 
 def parse_odometer(text):
@@ -36,47 +22,62 @@ def parse_odometer(text):
         return 0
     text = text.lower().replace("тис.", "").replace("км", "").strip()
     try:
-        return int(float(text.replace(',', '.')) * 1000)
-    except:
+        if 'тис' in text:
+            numeric_part = re.sub(r'[^0-9,.]', '', text)
+            return int(float(numeric_part.replace(',', '.')) * 1000)
+        else:
+            numeric_part = re.sub(r'[^0-9]', '', text)
+            return int(numeric_part)
+    except Exception:
         return 0
 
 
-def parse_car(url, db_session, request_session):
+async def parse_car(url, http_session):
+    db = await get_session()
     try:
-        time.sleep(uniform(0.5, 2))
-
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-
-        response = request_session.get(url, headers=headers)
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.text, 'html.parser')
+        html = await fetch(http_session, url)
+        soup = BeautifulSoup(html, "html.parser")
 
         title = soup.find("h1").text.strip() if soup.find("h1") else "No title"
-
         price_elem = soup.select_one(".price_value")
         price = int(re.sub(r"\D", "", price_elem.text)) if price_elem else 0
 
-        odometer_elem = soup.select_one(".base-information span:-soup-contains('Пробіг')")
-        odometer = parse_odometer(odometer_elem.text) if odometer_elem else 0
+        odometer = 0
+        odometer_text = soup.select_one(".technical-info > dd")
+        if odometer_text and "пробіг" in odometer_text.get_text().lower():
+            odometer = parse_odometer(odometer_text.get_text())
+        else:
+            odometer_elem = soup.select_one(".base-information span:-soup-contains('Пробіг')")
+            odometer = parse_odometer(odometer_elem.text) if odometer_elem else 0
 
-        username_elem = soup.select_one(".seller_info_name")
-        username = username_elem.text.strip() if username_elem else "No username"
+        username = soup.select_one(".seller_info_name").text.strip() if soup.select_one(
+            ".seller_info_name") else "No username"
 
-        phone_number = "+380..."  # Default value
+        phone_number = "+380..."
 
         image_elem = soup.select_one(".photo-620x465")
-        image_url = image_elem["src"] if image_elem else ""
+        image_url = image_elem["src"] if image_elem and "src" in image_elem.attrs else ""
+        images_count = len(soup.select(".photo-620x465"))
 
-        images_count = len(soup.select(".photo-620x465")) if soup.select(".photo-620x465") else 0
+        car_number = ""
+        car_vin = ""
 
-        car_number_elem = soup.find(text=re.compile("Номер"))
-        car_number = car_number_elem.find_next().text if car_number_elem else ""
+        info_blocks = soup.select(".technical-info-list li")
+        for block in info_blocks:
+            text = block.get_text()
+            if "Номер" in text:
+                car_number = block.select_one(".label").text.strip() if block.select_one(
+                    ".label") else ""
+            elif "VIN" in text:
+                car_vin = block.select_one(".label").text.strip() if block.select_one(
+                    ".label") else ""
 
-        car_vin_elem = soup.find(text=re.compile("VIN"))
-        car_vin = car_vin_elem.find_next().text if car_vin_elem else ""
+        if not car_number:
+            car_number_elem = soup.find(text=re.compile("Номер"))
+            car_number = car_number_elem.find_next().text if car_number_elem else ""
+        if not car_vin:
+            car_vin_elem = soup.find(text=re.compile("VIN"))
+            car_vin = car_vin_elem.find_next().text if car_vin_elem else ""
 
         car = Car(
             url=url,
@@ -90,55 +91,39 @@ def parse_car(url, db_session, request_session):
             car_number=car_number,
             car_vin=car_vin
         )
-
-        db_session.add(car)
-        db_session.commit()
+        db.add(car)
+        await db.commit()
+        print(f"[SCRAPED] {url}")
 
     except IntegrityError:
-        db_session.rollback()
+        await db.rollback()
+        print(f"[DUPLICATE] {url}")
     except Exception as e:
-        print(f"Error parsing {url}: {str(e)}")
-        db_session.rollback()
+        print(f"[ERROR] {url} — {e}")
+        await db.rollback()
+    finally:
+        await db.close()
 
 
-def scrape():
-    db_session = SessionLocal()
-    request_session = create_session()
+async def scrape():
+    from app.config import MAX_PAGES
+    async with aiohttp.ClientSession() as session:
+        print("Scraping started...")
+        for page in range(MAX_PAGES):
+            try:
+                page_url = f"{START_URL}?page={page}"
+                html = await fetch(session, page_url)
+                soup = BeautifulSoup(html, "html.parser")
+                links = [a["href"] for a in soup.select(".ticket-title a") if "auto" in a["href"]]
+                if not links:
+                    print(f"No links found on page {page}, stopping.")
+                    break
 
-    request_session.timeout = 10
+                await asyncio.gather(*[parse_car(link, session) for link in links])
 
-    print("Scraping started...")
-    page = 0
-    max_pages = 10
-
-    while page < max_pages:
-        try:
-            page_url = f"{START_URL}?page={page}"
-            print(f"Processing page {page}")
-
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-
-            response = request_session.get(page_url, headers=headers)
-            response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, "html.parser")
-            links = [a["href"] for a in soup.select(".ticket-title a") if "auto" in a["href"]]
-
-            if not links:
+                await asyncio.sleep(uniform(1, 3))
+            except Exception as e:
+                print(f"[PAGE ERROR] {page} — {e}")
                 break
 
-            for link in links:
-                parse_car(link, db_session, request_session)
-
-            page += 1
-            time.sleep(uniform(1, 3))
-
-        except Exception as e:
-            print(f"Error processing page {page}: {str(e)}")
-            break
-
-    db_session.close()
-    request_session.close()
     print("Scraping finished.")
