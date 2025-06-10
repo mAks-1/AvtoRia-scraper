@@ -1,0 +1,30 @@
+services:
+  app:
+    build: .
+    depends_on:
+      - db
+    env_file:
+      - .env
+    volumes:
+      - ./dumps:/app/dumps
+      - ./alembic/versions:/app/alembic/versions
+    networks:
+      - appnet
+
+  db:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: autoria
+      PGPASSFILE: /root/.pgpass
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - appnet
+
+volumes:
+  pgdata:
+
+networks:
+  appnet:
