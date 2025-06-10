@@ -21,3 +21,17 @@ def dump_db():
     print(f"Database dumped to {filename}")
 
 
+def start():
+    scheduler = BlockingScheduler()
+    hour, minute = map(int, SCRAPING_TIME.split(":"))
+    scheduler.add_job(scrape, 'cron', hour=hour, minute=minute)
+
+    dhour, dminute = map(int, DUMP_TIME.split(":"))
+    scheduler.add_job(dump_db, 'cron', hour=dhour, minute=dminute)
+
+    print("Scheduler started")
+    scheduler.start()
+
+
+if __name__ == "__main__":
+    start()
