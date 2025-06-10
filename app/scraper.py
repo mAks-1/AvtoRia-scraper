@@ -99,3 +99,46 @@ def parse_car(url, db_session, request_session):
     except Exception as e:
         print(f"Error parsing {url}: {str(e)}")
         db_session.rollback()
+
+
+def scrape():
+    db_session = SessionLocal()
+    request_session = create_session()
+
+    request_session.timeout = 10
+
+    print("Scraping started...")
+    page = 0
+    max_pages = 10
+
+    while page < max_pages:
+        try:
+            page_url = f"{START_URL}?page={page}"
+            print(f"Processing page {page}")
+
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+
+            response = request_session.get(page_url, headers=headers)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            links = [a["href"] for a in soup.select(".ticket-title a") if "auto" in a["href"]]
+
+            if not links:
+                break
+
+            for link in links:
+                parse_car(link, db_session, request_session)
+
+            page += 1
+            time.sleep(uniform(1, 3))
+
+        except Exception as e:
+            print(f"Error processing page {page}: {str(e)}")
+            break
+
+    db_session.close()
+    request_session.close()
+    print("Scraping finished.")
